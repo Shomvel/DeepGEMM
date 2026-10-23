@@ -3,6 +3,7 @@
 #include "../utils/compatibility.hpp"
 #include <ATen/Context.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <limits>
 
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
@@ -401,12 +402,29 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     // Contiguity checks
     DG_HOST_ASSERT(a.first.is_contiguous());
     DG_HOST_ASSERT(b.first.is_contiguous());
-    DG_HOST_ASSERT(d.is_contiguous());
-    DG_HOST_ASSERT(c.has_value() and c.value().is_contiguous());
+    if (not d.is_contiguous()) {
+        // No-C may write a column slice of a packed [groups, M, full_N]
+        // gradient. The existing 2D TMA descriptor flattens groups and M,
+        // retaining this row stride and the slice's data_ptr as its base.
+        DG_HOST_ASSERT(not c.has_value() and "Strided K-group output requires C=None");
+        DG_HOST_ASSERT(d.stride(-1) == 1 and d.stride(-2) >= n);
+        DG_HOST_ASSERT(d.stride(0) == static_cast<int64_t>(m) * d.stride(-2));
+        const auto row_bytes = d.stride(-2) * d.element_size();
+        DG_HOST_ASSERT(row_bytes <= std::numeric_limits<int>::max());
+        DG_HOST_ASSERT(row_bytes % 16 == 0 and reinterpret_cast<std::uintptr_t>(d.data_ptr()) % 16u == 0u);
+    }
+    DG_HOST_ASSERT(not c.has_value() or c.value().is_contiguous());
 
     // Early return for trivial cases
     if (early_return(m, n, sum_k, d, c))
         return;
+
+    // D flattens experts and M; a tail STORE cannot stop at an expert boundary.
+    // Keep single-expert and zero-K early returns, and leave accumulation alone.
+    // The SM90 heuristic additionally requires BLOCK_M to divide each expert M.
+    const auto arch_major = jit->device.get_arch_major();
+    if (arch_major == 9 and not c.has_value() and num_groups > 1)
+        DG_HOST_ASSERT(m % 64 == 0 and "SM90 multi-group overwrite requires M divisible by 64");
 
     // Transform SF with padding
     const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, 128, false);
@@ -419,7 +437,6 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
                                                 a.first.options().dtype(torch::kByte));
 
     // Dispatch implementation
-    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         sm90_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks_cpu.value(), grouped_layout, tensor_map_buffer,
                                      cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
@@ -708,10 +725,13 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
     // Dispatch implementation
     const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
-        // No direct output or psum on SM90
-        DG_HOST_ASSERT(c.has_value());
+        // SM90 supports overwrite when C is absent; psum layout remains unsupported.
         DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        // The output TMA descriptor flattens experts and M. The heuristic then
+        // chooses a BLOCK_M dividing M, so no STORE reaches the next expert.
+        if (not c.has_value() and num_groups > 1)
+            DG_HOST_ASSERT(m % 64 == 0 and "SM90 multi-group overwrite requires M divisible by 64");
         sm90_bf16_k_grouped_gemm(a, b, c, d, m, n, ks_cpu.value(), grouped_layout,
                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
     } else if (arch_major == 10) {

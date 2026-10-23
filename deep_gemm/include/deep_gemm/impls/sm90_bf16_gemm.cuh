@@ -229,7 +229,9 @@ sm90_bf16_gemm_impl(int* grouped_layout,
         const uint32_t b_desc_lo = __shfl_sync(0xffffffff, b_desc.reg32_[0], 0);
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            if (is_k_grouped_contiguous(kGemmType) and scheduler.current_shape_k == 0)
+            // A K-group output tile has one owner across the entire reduction.
+            // Without C, empty experts must explicitly store the zero accumulator.
+            if (kWithAccumulation and is_k_grouped_contiguous(kGemmType) and scheduler.current_shape_k == 0)
                 continue;
 
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;

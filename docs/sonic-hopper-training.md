@@ -12,13 +12,54 @@ The latter physically transposes **each expert separately**, and requantizes alo
 the token reduction axis. Its FP32 scale tensor is `[features,sumK/128]`. Neither
 transposing token-major FP8 bytes nor reusing forward scales implements this format.
 
-All wgrad output is FP32, zero-initialized before the required SM90 accumulation.
-Every conversion is included in the adapter call. Caller must supply zero padding
-for both wgrad operands. There is no activation epilogue fusion or weight cache.
-The grouped GEMM mainloops are unchanged. The optional scatter path adds a
+Wgrad defaults to FP32 and accepts `output_dtype=torch.bfloat16`. Both paths
+default to `overwrite=True`: fresh output is not cleared, and the native SM90
+epilogue stores every result, including zeros for empty experts. Explicit
+`overwrite=False` retains zero-initialized accumulation. The native APIs still
+accumulate when C is supplied. BF16 output keeps FP32 register accumulation and
+rounds at writeback, removing the large FP32 gradient and subsequent cast.
+On SM90, nonempty multi-expert overwrite requires M divisible by 64, and the
+selected tile must divide M, so a tail store cannot overwrite the next expert.
+C-present accumulation, single-expert tails and all-empty zero-fill retain their
+previous contracts. The
+FP8 1D1D epilogue supports this output dtype with an unswizzled BF16 shared-memory
+tile; its matrix multiplication is unchanged. Caller must supply zero padding
+for both wgrad operands, except that gathered operands mask padding themselves.
+There is no cross-step weight cache. The grouped GEMM math mainloops are unchanged;
+SM90 K-group multicast configurations must keep each physical CTA cluster within
+one expert. The optional scatter path adds a
 CUDA epilogue to both SM90 BF16 and FP8 1D2D kernels. FP8 training uses approximate
 straight-through gradients. No numerical convergence claim follows from a short
 smoke training run.
+
+Additional adapter operations are `m_gemm_gather` (FP8 token gather fused with
+quantization) and `m_gemm_columns` (reused BF16 column workspace). The latter yields
+`(column_offset, tile)`; a consumer must enqueue use of the tile on the same CUDA
+stream before requesting the next tile, or clone it for longer retention. FP8
+activations are quantized once per projection. Scale tensors are emitted in
+native MN-major TMA layout to avoid repeated transposes. Supported packed BF16
+transposed weights are passed to the native kernel without copying. K-group
+quantization also accepts a token-to-route gather, while still transposing and
+scaling each expert group independently.
+
+`wgrad_gather_rhs_columns(lhs, tokens, row_to_route, topk, columns=2048,
+output_dtype=torch.float32)` bounds the FP8 RHS gather workspace. It quantizes
+lhs once, then gathers feature chunks into reusable FP8 and FP32 scale buffers.
+Each native K-group GEMM overwrites the corresponding column slice of the final
+`[experts,lhs_features,token_features]` gradient. There is no BF16 chunk buffer or
+copy into the output. With R padded routes and C workspace columns, the RHS
+scratch is `R*C + 4*(R/128)*C` bytes instead of scaling with the full token width.
+`columns` must be a positive multiple of 128; the last chunk can be shorter.
+Source row strides and column offsets use 64-bit address arithmetic. Token
+columns must be contiguous, but token rows need not be. The final output retains
+the native 16-byte TMA row-alignment requirement.
+
+A producer that already emits native K-group FP8 lhs values can call this method
+with `lhs=None, quantized_lhs=(q_flat, scales)`. The scale tensor has shape
+`[lhs_features,R/128]` and strides `(1,lhs_features)`. This avoids creating a BF16
+lhs just to quantize it again; both prequantized tensors remain unchanged. Native
+K-group column slices support overwrite only. Accumulation into a strided slice
+is rejected, while contiguous outputs retain their existing C-present behavior.
 
 On Ubuntu 24.04, install `libdw-dev libelf-dev` before building the C++ extension
 (the pinned DeepJIT revision includes `elfutils/libdwfl.h`). GCC 13+ is required
@@ -28,27 +69,6 @@ Run `python -m pytest tests/test_sonic_training.py -q` on Hopper, with PyTorch,
 Triton, CUDA 12.9+ and a built DeepGEMM extension. The independent FP32 checks
 include strided weights, an empty expert, per-expert transposed FP8 scale layout,
 and weighted/unweighted atomic scatter with padding and cancellation.
-
-## Historical materialized validation, 2026-10-23
-
-The companion [SonicMoE branch](https://github.com/Shomvel/sonic-moe/tree/deepgemm-hopper-training)
-uses this adapter for all six expert-layer training GEMMs. On one H100 80GB,
-adapter M-GEMM relative L2 errors against FP32 were 0.0016583 (BF16) and 0.0369523
-(FP8). Weight-gradient errors were 2.07e-7 and 0.0272196 respectively. Empty-expert
-weight gradients were exactly zero. Its full MoE numerical, wrapper and 20-step
-SGD checks also passed.
-
-For T/D/I/E/K=4096/4096/2048/8/2, synchronized expert forward+backward took
-2.386 ms with original Sonic BF16, 5.855 ms with this BF16 adapter and 4.818 ms
-with FP8. Packing and quantization are included. The adapter has no measured
-end-to-end speed or memory advantage in these tests. Full results and limits are
-in the companion branch's `assets/deepgemm-hopper-training.md` and
-`assets/deepgemm-h100-results.json`.
-
-The executed environment was CUDA 13.0, NVIDIA PyTorch
-`2.10.0a0+b558c986e8.nv25.11`, Python 3.12.3, GCC 13.3 and Triton
-`3.5.0+gitde3506d2`. This test leaves the SM90 CUDA mainloop unchanged. H800/H200
-and long-run training convergence have not been executed.
 
 ## FP32 token scatter epilogue
 
@@ -80,32 +100,12 @@ router derivative and the six GEMM training structure. Raw FP32 scatter also
 removes the previous per-route BF16 output rounding, so numerical results are not
 bitwise equal to the materialized path.
 
-## Scatter H100 validation
+## Clean H100 validation: opt-r15
 
-Both new CUDA epilogues passed weighted/unweighted, bias, cancellation, nonzero
-padding, empty-expert and invalid-metadata checks. FP32 scatter relative L2 error
-against independent FP32 GEMM/reduction was at most 1.29e-7 for BF16 and 3.67%
-for FP8. Ordinary M-GEMM and K-grouped weight-gradient regressions also passed.
-The companion Sonic layer passed output/all-gradient, wrapper and 20-step SGD
-checks with scatter enabled, including top-k=8 signed scores and empty batches.
+[Native acceptance data](sonic-hopper-training-validation.json) records the clean-build adapter/scatter checks, 40 multicast cases, 16 overwrite cases, 8 strided-output cases, 10 gathered-column checks and 120 M-tail combinations. Real row/K quantization and companion dH/AP/DS/gather/bias tests cross 2**31 element addresses. No-C multi-group M-tail rejection and C-present/single-group/all-empty compatibility are covered.
 
-For the pre-grouped down-projection at T/D/I/E/K=32768/4096/256/8/8, BF16 peak
-incremental allocation falls from 2304 to 768 MiB, but latency increases from
-2.029 to 7.375 ms. FP8 falls from 2304 to 842 MiB and increases from 2.178 to
-7.656 ms. These CUDA-event timings include zeroing/casting and FP8 conversions.
-All tokens select the 8 experts in expert order. This validates removal of the
-2 GiB route-expanded output; it does not establish a speedup or full-layer peak
-reduction of the same size.
+The companion Sonic fork passed 42 strict FP32 full-layer cases, all gradients, wrappers, 20-step FP32-master SGD and 55 whole-layer timing records. BF16 maximum relative L2 error was 0.4630%, FP8 6.6957%; the optional dH-recompute path was bitwise identical to default FP8 on its 9 full-gradient cases and final short-training outputs/parameters. These checks do not establish long-run convergence.
 
-For whole-layer T/D/I/E/K=4096/4096/512/8/8, scatter reduces BF16 incremental peak
-from 1248.75 to 992.75 MiB while increasing forward+backward from 4.457 to
-5.620 ms. FP8 drops from 1290.82 to 1066.82 MiB, increasing 5.686 to 6.946 ms.
-Original Sonic is 2.350 ms and 480.52 MiB. The first atomic implementation is
-therefore a memory/time tradeoff, not a competitive throughput backend.
+For T32768/D4096/I1536/E64/K8, optional recompute measured 47.414 ms / 5858.26 MiB incremental peak versus original Sonic BF16 51.531 ms / 6404.13 MiB. FP8 is approximate training, not an equal-precision substitution. Other shapes have time/memory tradeoffs. See the companion `assets/deepgemm-hopper-training.md` and optimized results/provenance JSON for full tables and exact scope.
 
-The companion branch's `assets/deepgemm-hopper-training.md` includes all four
-shapes and measurement definitions. Raw results and provenance are in
-`assets/deepgemm-h100-scatter-{results,adapters,provenance}.json`. The clean build
-completed with exit 0 on H100; source/install hashes matched and the job was
-removed. H800/H200 and long-run convergence remain untested. The build now tracks
-C++ API headers as extension dependencies to prevent stale native objects.
+Only H100 was executed, using CUDA 13.0 and NVIDIA Torch 2.10.0a0+b558c986e8.nv25.11, QuACK 0.6.4 and CUTLASS DSL 4.6.2. The companion package declares Torch >=2.11; the source-import prerelease test is not general 2.10 support. Source/install/native hashes matched; the job completed with exit 0 and was deleted. H800/H200 remain untested.

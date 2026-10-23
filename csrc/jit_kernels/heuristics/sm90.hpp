@@ -26,7 +26,7 @@ struct SM90ArchSpec {
             if (desc.m <= 32) block_m_candidates.push_back(32);
 
             // BF16 output GEMM supports 256
-            if (desc.cd_dtype != torch::kFloat)
+            if (desc.cd_dtype != torch::kFloat and desc.kernel_type != KernelType::Kernel1D1D)
                 block_m_candidates.push_back(256);
         } else if (desc.gemm_type == GemmType::MGroupedContiguous or
                    desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout) {
@@ -79,7 +79,26 @@ struct SM90ArchSpec {
                     continue;
 
                 for (int block_m: block_m_candidates) {
+                    // K-group D flattens [groups, M] into one TMA dimension.
+                    // A no-C tail store can therefore zero the next expert's
+                    // rows, even when its accumulator is entirely padding.
+                    // FP8 stores per 64-row warp group but issues every warp
+                    // group's store, so both FP8 and BF16 need full BM tiles.
+                    if (desc.gemm_type == GemmType::KGroupedContiguous and
+                        not desc.with_accumulation and desc.num_groups > 1 and desc.m % block_m != 0)
+                        continue;
+
                     for (int block_n: block_n_candidates) {
+                        // K groups may have different K lengths (including zero).
+                        // Keep every physical multicast cluster inside one group:
+                        // an odd tile count would pair the previous group's tail
+                        // with the next group's first tile. Their multicast flags
+                        // and pipeline progress can differ, leaving a peer waiting
+                        // for a load that the cluster leader never issues.
+                        if (desc.gemm_type == GemmType::KGroupedContiguous and
+                            (ceil_div(desc.m, block_m) * ceil_div(desc.n, block_n)) % (cluster_m * cluster_n) != 0)
+                            continue;
+
                         // 1D2D kernel unroll requirement
                         if (desc.kernel_type == KernelType::Kernel1D2D and block_n > block_k and (block_n % (block_n - block_k) != 0 and block_k % (block_n - block_k) != 0))
                             continue;
@@ -134,8 +153,8 @@ struct SM90ArchSpec {
             desc.major_a == cute::UMMA::Major::K ? layout.block_k : load_block_m, c10::elementSize(desc.a_dtype));
         const auto swizzle_mode_b = get_swizzle_mode(
             desc.major_b == cute::UMMA::Major::K ? layout.block_k : load_block_n, c10::elementSize(desc.b_dtype));
-        // We only enable swizzling for non-FP32 outputs
-        const auto swizzle_mode_cd = desc.cd_dtype != torch::kFloat ?
+        // 1D1D stores register pairs into a linear shared-memory tile.
+        const auto swizzle_mode_cd = desc.cd_dtype != torch::kFloat and desc.kernel_type != KernelType::Kernel1D1D ?
             get_swizzle_mode(store_block_n, c10::elementSize(desc.cd_dtype)) : 0;
 
         return {
