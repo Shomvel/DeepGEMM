@@ -20,6 +20,7 @@
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 #include <deep_gemm/scheduler/gemm.cuh>
+#include <deep_gemm/epilogue/sm90_scatter.cuh>
 
 namespace deep_gemm {
 
@@ -43,14 +44,17 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
-          typename cd_dtype_t>
+          typename cd_dtype_t, bool kScatter = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                        float* scatter_output, const int64_t* row_to_route,
+                        const float* scatter_scores, const __nv_bfloat16* scatter_bias,
+                        int64_t scatter_topk, int64_t scatter_num_tokens) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
@@ -60,6 +64,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // C/D type: only BF16 without accumulation
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
+
+    DG_STATIC_ASSERT(not kScatter or kGemmType == GemmType::MGroupedContiguous, "Scatter requires contiguous M groups");
 
     // Types
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
@@ -96,7 +102,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
-        cute::prefetch_tma_descriptor(&tensor_map_d);
+        if constexpr (not kScatter)
+            cute::prefetch_tma_descriptor(&tensor_map_d);
     }
     __syncwarp();
 
@@ -366,6 +373,14 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             // Skip WGMMA store for the unfilled parts
             if (not do_wgmma_store)
                 continue;
+
+            if constexpr (kScatter) {
+                sm90_scatter_accum<BLOCK_M, BLOCK_N, WAVE_BLOCK_M, WGMMA::kNumAccum>(
+                    final_accum, m_block_idx, n_block_idx, shape_m, shape_n, warp_idx, lane_idx,
+                    grouped_layout, scatter_output, row_to_route, scatter_scores, scatter_bias,
+                    scatter_topk, scatter_num_tokens);
+                continue;
+            }
 
             // Wait last TMA store to be finished
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)

@@ -30,6 +30,9 @@ cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declar
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
 sources = ['csrc/python_api.cpp']
+# setuptools otherwise only checks python_api.cpp and can reuse a stale module
+# after API/header changes, even when DG_FORCE_BUILD bypasses wheel downloads.
+header_dependencies = sorted(str(p) for p in Path('csrc').rglob('*.hpp'))
 build_include_dirs = [
     f'{CUDA_HOME}/include',
     f'{CUDA_HOME}/include/cccl',
@@ -102,6 +105,7 @@ def get_ext_modules():
 
     return [CUDAExtension(name='deep_gemm._C',
                           sources=sources,
+                          depends=header_dependencies,
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
                           library_dirs=build_library_dirs,

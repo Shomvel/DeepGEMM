@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../utils/compatibility.hpp"
+#include <ATen/Context.h>
+#include <c10/cuda/CUDAFunctions.h>
 
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
@@ -832,7 +834,84 @@ static void batched_symm(const torch::Tensor& a, const torch::Tensor& b,
     cublaslt_batched_gemm(a_3d, b_transposed, d_3d, m, k, m, num_batches, major_a, major_b);
 }
 
+// Scatter APIs retain the grouped GEMM layout contract: each aligned M tile
+// belongs to one expert. row_to_route uses -1 padding and flattened token/top-k
+// indices. output is caller-initialized FP32 storage and is accumulated into.
+static SM90ScatterArgs check_sm90_scatter(
+    const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& output,
+    const torch::Tensor& experts, const torch::Tensor& routes, const int64_t topk,
+    const std::optional<torch::Tensor>& scores, const std::optional<torch::Tensor>& bias) {
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
+    DG_HOST_ASSERT(not heuristics_runtime->get_deterministic_algorithms() and
+                   not at::globalContext().deterministicAlgorithms() and
+                   "FP32 atomic scatter is nondeterministic");
+    DG_HOST_ASSERT(a.dim() == 2 and b.dim() == 3 and output.dim() == 2);
+    const auto m = a.size(0), k = a.size(1), n = b.size(1), e = b.size(0);
+    DG_HOST_ASSERT(e > 0 and n > 0 and k > 0 and topk > 0);
+    DG_HOST_ASSERT(b.size(2) == k and output.size(1) == n);
+    DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and output.is_contiguous());
+    DG_HOST_ASSERT(a.is_cuda() and a.get_device() == c10::cuda::current_device());
+    const auto check_device = [&](const torch::Tensor& t) {
+        DG_HOST_ASSERT(t.is_cuda() and t.device() == a.device() and t.is_contiguous());
+    };
+    check_device(b); check_device(output); check_device(experts); check_device(routes);
+    DG_HOST_ASSERT(output.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(experts.dim() == 1 and experts.numel() == m and experts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(routes.dim() == 1 and routes.numel() == m and routes.scalar_type() == torch::kLong);
+    DG_HOST_ASSERT(m % heuristics_runtime->get_mk_alignment_for_contiguous_layout() == 0 and k % 128 == 0 and n % 128 == 0);
+    if (scores) {
+        check_device(*scores);
+        DG_HOST_ASSERT(scores->scalar_type() == torch::kFloat and scores->numel() == output.size(0) * topk);
+    }
+    if (bias) {
+        check_device(*bias);
+        DG_HOST_ASSERT(bias->scalar_type() == torch::kBFloat16 and bias->dim() == 2 and
+                       bias->size(0) == e and bias->size(1) == n);
+    }
+    return {output.data_ptr(), routes.data_ptr(), scores ? scores->data_ptr() : nullptr,
+            bias ? bias->data_ptr() : nullptr, topk, output.size(0)};
+}
+
+static void m_grouped_bf16_gemm_nt_scatter(
+    const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& output,
+    const torch::Tensor& experts, const torch::Tensor& routes, const int64_t topk,
+    const std::optional<torch::Tensor>& scores, const std::optional<torch::Tensor>& bias) {
+    const auto scatter = check_sm90_scatter(a, b, output, experts, routes, topk, scores, bias);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 and b.scalar_type() == torch::kBFloat16);
+    if (a.size(0) == 0) return;
+    sm90_m_grouped_bf16_gemm_contiguous(a, b, torch::Tensor(), experts,
+        b.size(0), a.size(0), b.size(1), a.size(1), cute::UMMA::Major::K, cute::UMMA::Major::K,
+        "nk", false, std::nullopt, scatter);
+}
+
+static void m_grouped_fp8_gemm_nt_scatter(
+    const std::pair<torch::Tensor, torch::Tensor>& a,
+    const std::pair<torch::Tensor, torch::Tensor>& b, const torch::Tensor& output,
+    const torch::Tensor& experts, const torch::Tensor& routes, const int64_t topk,
+    const std::optional<torch::Tensor>& scores, const std::optional<torch::Tensor>& bias) {
+    const auto scatter = check_sm90_scatter(a.first, b.first, output, experts, routes, topk, scores, bias);
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn and b.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(a.second.is_cuda() and b.second.is_cuda() and
+                   a.second.device() == output.device() and b.second.device() == output.device());
+    DG_HOST_ASSERT(a.second.scalar_type() == torch::kFloat and b.second.scalar_type() == torch::kFloat);
+    const int m = a.first.size(0), n = b.first.size(1), k = a.first.size(1), e = b.first.size(0);
+    if (m == 0) return;
+    std::optional<std::tuple<int, int, int>> recipe = std::make_tuple(1, 128, 128);
+    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe,
+        std::nullopt, std::nullopt, std::nullopt, e, true);
+    sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, torch::Tensor(), experts,
+        e, m, n, k, cute::UMMA::Major::K, cute::UMMA::Major::K, get_major_type_ab(sfb),
+        "nk", false, std::nullopt, scatter);
+}
+
 static void register_apis(pybind11::module_& m) {
+    m.def("m_grouped_bf16_gemm_nt_scatter", &m_grouped_bf16_gemm_nt_scatter,
+          py::arg("a"), py::arg("b"), py::arg("output_acc"), py::arg("grouped_layout"),
+          py::arg("row_to_route"), py::arg("topk"), py::arg("scores") = std::nullopt, py::arg("bias") = std::nullopt);
+    m.def("m_grouped_fp8_gemm_nt_scatter", &m_grouped_fp8_gemm_nt_scatter,
+          py::arg("a"), py::arg("b"), py::arg("output_acc"), py::arg("grouped_layout"),
+          py::arg("row_to_route"), py::arg("topk"), py::arg("scores") = std::nullopt, py::arg("bias") = std::nullopt);
 
     // FP8 FP4 GEMMs
     m.def("fp8_fp4_gemm_nt", &fp8_fp4_gemm_nt,

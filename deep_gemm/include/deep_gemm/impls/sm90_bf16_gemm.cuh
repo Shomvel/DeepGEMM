@@ -21,6 +21,7 @@
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 #include <deep_gemm/scheduler/gemm.cuh>
+#include <deep_gemm/epilogue/sm90_scatter.cuh>
 
 namespace deep_gemm {
 
@@ -34,13 +35,16 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs,
           GemmType kGemmType, bool kWithAccumulation,
-          typename cd_dtype_t>
+          typename cd_dtype_t, bool kScatter = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_bf16_gemm_impl(int* grouped_layout,
                     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                    const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                    const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                        float* scatter_output, const int64_t* row_to_route,
+                        const float* scatter_scores, const __nv_bfloat16* scatter_bias,
+                        int64_t scatter_topk, int64_t scatter_num_tokens) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Enlarge `BLOCK_K` for some cases
     // NOTES: this is for reducing the `warpgroup_wait<0>()` overhead
@@ -54,6 +58,8 @@ sm90_bf16_gemm_impl(int* grouped_layout,
     constexpr uint32_t kNumStagesPerMerge = kDoMergeStages ? kNumStages_ / kNumMinStages : 1;
     constexpr uint32_t BLOCK_K = BLOCK_K_ * kNumStagesPerMerge;
     constexpr uint32_t kNumStages = kNumStages_ / kNumStagesPerMerge;
+
+    DG_STATIC_ASSERT(not kScatter or kGemmType == GemmType::MGroupedContiguous, "Scatter requires contiguous M groups");
 
     // Types
     using WGMMA = typename mma::sm90::BF16MMASelector<BLOCK_N, kMajorA, kMajorB>::type;
@@ -85,7 +91,8 @@ sm90_bf16_gemm_impl(int* grouped_layout,
     if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
-        cute::prefetch_tma_descriptor(&tensor_map_cd);
+        if constexpr (not kScatter)
+            cute::prefetch_tma_descriptor(&tensor_map_cd);
     }
     __syncwarp();
 
@@ -293,6 +300,14 @@ sm90_bf16_gemm_impl(int* grouped_layout,
             // Skip WGMMA store for the unfilled parts
             if (not do_wgmma_store)
                 continue;
+
+            if constexpr (kScatter) {
+                sm90_scatter_accum<BLOCK_M, BLOCK_N, WAVE_BLOCK_M, WGMMA::kNumAccum>(
+                    accum, m_block_idx, n_block_idx, shape_m, shape_n, warp_idx, lane_idx,
+                    grouped_layout, scatter_output, row_to_route, scatter_scores, scatter_bias,
+                    scatter_topk, scatter_num_tokens);
+                continue;
+            }
 
             // Wait last TMA store to be finished
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)

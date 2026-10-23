@@ -8,6 +8,7 @@
 #include "../heuristics/sm90.hpp"
 
 #include "runtime_utils.hpp"
+#include "sm90_scatter.hpp"
 
 namespace deep_gemm {
 
@@ -24,6 +25,7 @@ public:
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_d;
         CUtensorMap tensor_map_sfa;
+        SM90ScatterArgs scatter;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -43,7 +45,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -58,7 +60,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        to_string(args.gemm_desc.cd_dtype)));
+        to_string(args.gemm_desc.cd_dtype), args.scatter.output != nullptr));
 
         // Launch
         jit->launch(
@@ -66,7 +68,9 @@ static void __instantiate_kernel() {{
             args.sfb, args.grouped_layout,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a, args.tensor_map_b,
-            args.tensor_map_d, args.tensor_map_sfa
+            args.tensor_map_d, args.tensor_map_sfa,
+            args.scatter.output, args.scatter.row_to_route, args.scatter.scores, args.scatter.bias,
+            args.scatter.topk, args.scatter.num_tokens
         );
     }
 };
@@ -144,8 +148,9 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                                     const std::string& compiled_dims,
                                                     const bool& use_psum_layout,
-                                                    const std::optional<int>& expected_m_for_psum_layout) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+                                                    const std::optional<int>& expected_m_for_psum_layout,
+                                                const SM90ScatterArgs& scatter = {}) {
+    DG_HOST_ASSERT(scatter.output or d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto gemm_type = use_psum_layout ?
@@ -160,7 +165,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .kernel_type = KernelType::Kernel1D2D,
         .m = m, .n = n, .k = k, .num_groups = num_groups,
         .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
-        .cd_dtype = d.scalar_type(),
+        .cd_dtype = torch::kBFloat16,
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
         .num_sms = runtime->get_num_sms(),
@@ -185,7 +190,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                               config.layout.block_k,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode);
-    const auto tensor_map_d = make_tma_cd_desc(d, m, n,
+    const auto tensor_map_d = scatter.output ? CUtensorMap{} : make_tma_cd_desc(d, m, n,
                                                config.storage_config.store_block_m,
                                                config.storage_config.store_block_n,
                                                static_cast<int>(d.stride(-2)), 1,
@@ -210,6 +215,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
+        .scatter = scatter,
     });
 }
 

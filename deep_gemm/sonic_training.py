@@ -136,6 +136,26 @@ class GroupedTrainingGemm:
                 self.layout.m_indices, recipe=(1, 128, 128), disable_ue8m0_cast=True)
         return out
 
+    def m_gemm_scatter(self, a, w, row_to_route, num_tokens, topk, scores=None, bias=None):
+        """Accumulate FP32 WGMMA results directly into tokens, then cast to BF16.
+
+        scores=None is the backward dX path; dH already contains routing weights.
+        The atomic reduction is nondeterministic. No [padded routes,N] output exists.
+        """
+        from . import m_grouped_bf16_gemm_nt_scatter, m_grouped_fp8_gemm_nt_scatter
+        if a.ndim != 2 or w.ndim != 3 or a.size(0) != self.layout.rows or a.size(1) != w.size(2):
+            raise ValueError("scatter GEMM expects grouped [rows,K] and [experts,N,K]")
+        out = torch.zeros((num_tokens, w.size(1)), dtype=torch.float32, device=a.device)
+        if self.precision == "bf16":
+            operands = a.contiguous(), w.contiguous()
+            fn = m_grouped_bf16_gemm_nt_scatter
+        else:
+            operands = quantize_rows(a.contiguous()), quantize_weights(w)
+            fn = m_grouped_fp8_gemm_nt_scatter
+        fn(*operands, out, self.layout.m_indices, row_to_route, topk,
+           None if scores is None else scores.float().contiguous(), bias)
+        return out.to(torch.bfloat16)
+
     def wgrad(self, lhs, rhs):
         from . import k_grouped_bf16_gemm_tn_contiguous, k_grouped_fp8_gemm_nt_contiguous
         if lhs.size(0) != self.layout.rows or rhs.size(0) != self.layout.rows:

@@ -55,6 +55,8 @@ from ._C import (
     k_grouped_fp4_gemm_nt_contiguous,
     k_grouped_fp8_gemm_nt_contiguous,
     k_grouped_fp8_gemm_tn_contiguous,
+    m_grouped_bf16_gemm_nt_scatter,
+    m_grouped_fp8_gemm_nt_scatter,
     # BF16 GEMMs
     bf16_gemm_nt, bf16_gemm_nn,
     bf16_gemm_tn, bf16_gemm_tt,
